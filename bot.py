@@ -448,9 +448,6 @@ ENABLE_SERVER_FOLLOWUPS = get_env_bool("ENABLE_SERVER_FOLLOWUPS", True)
 ENABLE_RANDOM_SERVER_MESSAGES = get_env_bool(
     "ENABLE_RANDOM_SERVER_MESSAGES", True
 )
-ENABLE_RANDOM_SERVER_MEMBER_DMS = get_env_bool(
-    "ENABLE_RANDOM_SERVER_MEMBER_DMS", False
-)
 ENABLE_RANDOM_FRIEND_DMS = get_env_bool("ENABLE_RANDOM_FRIEND_DMS", True)
 ENABLE_RANDOM_SERVER_FRIEND_REQUESTS = get_env_bool(
     "ENABLE_RANDOM_SERVER_FRIEND_REQUESTS", True
@@ -606,6 +603,12 @@ async def dm_checkup_task():
         candidates = []
 
         for ch in dm_channels:
+            try:
+                recipient = ch.recipient
+            except (AttributeError, stoat.NoData):
+                recipient = None
+            if recipient is None or not is_added_friend(recipient):
+                continue
             try:
                 if ch.last_message_id:
                     candidates.append(ch)
@@ -3205,7 +3208,7 @@ def is_join_dm_member_candidate(member):
     if getattr(member, "bot", False):
         return False
 
-    return True
+    return is_added_friend(member)
 
 
 def get_member_highest_role_rank(member):
@@ -3251,6 +3254,12 @@ def is_missing_send_message_permission(error):
 
 
 async def open_dm_channel(user, context):
+    if not is_added_friend(user):
+        logging.info(
+            "%s: skipped because the recipient is not an added friend.",
+            context,
+        )
+        return None
     try:
         return await user.open_dm()
     except stoat.HTTPException as error:
@@ -6373,7 +6382,14 @@ def get_current_relationship_status(user):
     relationship = relations.get(user_id)
     if relationship is not None:
         return getattr(relationship, "status", None)
-    return getattr(user, "relationship", None)
+    try:
+        return user.relationship
+    except (AttributeError, stoat.NoData):
+        return None
+
+
+def is_added_friend(user):
+    return is_friend_relationship_status(get_current_relationship_status(user))
 
 
 def is_not_added_relationship_status(status):
@@ -6384,21 +6400,6 @@ def is_not_added_server_member(member):
     return (
         is_safe_automatic_user_candidate(member)
         and is_not_added_relationship_status(get_current_relationship_status(member))
-    )
-
-
-def stoat_allows_direct_messages_with(user):
-    if is_friend_relationship_status(get_current_relationship_status(user)):
-        return True
-    own_user = getattr(bot, "user", None)
-    return bool(getattr(user, "bot", None) or getattr(own_user, "bot", None))
-
-
-def is_automatic_server_member_dm_candidate(member):
-    return (
-        is_not_added_server_member(member)
-        and is_automatic_dm_candidate(member)
-        and stoat_allows_direct_messages_with(member)
     )
 
 
@@ -6575,7 +6576,7 @@ async def generate_automatic_outbound_message(
 
 async def send_automatic_dm(recipient, *, source_label, instruction):
     recipient_id = str(getattr(recipient, "id", "unknown"))
-    if not is_automatic_dm_candidate(recipient):
+    if not is_added_friend(recipient) or not is_automatic_dm_candidate(recipient):
         return False
 
     automatic_dm_recipients_in_flight.add(recipient_id)
@@ -6719,61 +6720,6 @@ async def before_random_message_task():
     await wait_for_persistent_automatic_job_window(
         "random_server_message",
         AUTOMATIC_OUTBOUND_INTERVAL_MINUTES * 60,
-    )
-
-
-@background.loop(minutes=AUTOMATIC_OUTBOUND_INTERVAL_MINUTES)
-async def random_server_member_dm_task():
-    mark_automatic_job_started("random_server_member_dm")
-    try:
-        servers = [
-            server
-            for server in bot.servers.values()
-            if str(server.id) not in server_blacklist
-        ]
-        random.shuffle(servers)
-        attempted_user_ids = set()
-
-        for server in servers:
-            members = await collect_available_server_members(server, refresh=True)
-            candidates = [
-                member
-                for member in members
-                if str(getattr(member, "id", "")) not in attempted_user_ids
-                and is_automatic_server_member_dm_candidate(member)
-            ]
-            random.shuffle(candidates)
-
-            for recipient in candidates:
-                recipient_id = str(recipient.id)
-                attempted_user_ids.add(recipient_id)
-                if await send_automatic_dm(
-                    recipient,
-                    source_label="server-member",
-                    instruction=(
-                        f"Write one friendly, casual first DM to {get_stoat_display_name(recipient)}, "
-                        f"a member of the Stoat server {server.name}. Keep it to one "
-                        "short sentence and do not mention automation."
-                    ),
-                ):
-                    return
-
-        logging.info(
-            "No unadded shared-server member can be DM'd directly. Stoat "
-            "requires friendship between human accounts; the friend-request "
-            "job handles these members instead."
-        )
-    except Exception as error:
-        logging.exception("Error in random_server_member_dm_task: %s", error)
-
-
-@random_server_member_dm_task.before_loop
-async def before_random_server_member_dm_task():
-    await bot.wait_until_ready()
-    await wait_for_persistent_automatic_job_window(
-        "random_server_member_dm",
-        AUTOMATIC_OUTBOUND_INTERVAL_MINUTES * 60,
-        AUTOMATIC_OUTBOUND_STAGGER_SECONDS,
     )
 
 
@@ -7822,6 +7768,15 @@ async def handle_dm_command(message):
                 )
                 return
             target_user_id = str(target_user.id)
+
+            if not is_added_friend(target_user):
+                await safe_add_reaction(message, FAILURE_MARKER)
+                await safe_reply(
+                    message,
+                    "\u274c That user is not currently added as a friend.",
+                    mention_author=True,
+                )
+                return
 
             dm_channel = target_user.dm_channel
             if dm_channel is None:
@@ -9126,13 +9081,6 @@ async def on_ready():
 
     if ENABLE_RANDOM_SERVER_MESSAGES and not random_message_task.is_running():
         random_message_task.start()
-
-    if ENABLE_RANDOM_SERVER_MEMBER_DMS:
-        logging.warning(
-            "ENABLE_RANDOM_SERVER_MEMBER_DMS was requested but was not "
-            "started: Stoat forbids direct messages between unadded human "
-            "accounts. Friend requests and accepted-friend DMs remain enabled."
-        )
 
     if ENABLE_RANDOM_FRIEND_DMS and not random_friend_dm_task.is_running():
         random_friend_dm_task.start()
